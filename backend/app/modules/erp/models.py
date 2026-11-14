@@ -16,7 +16,7 @@ from sqlalchemy import (BigInteger, Boolean, CheckConstraint, Date, ForeignKey, 
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, PkMixin, Rate, TenantMixin, TimestampMixin, E
-from app.db.enums import (AccountKind, AccountType, AmountKind, ApprovalStatus, ChargeType, HoldStatus, InvoiceStatus,
+from app.db.enums import (DisputeStatus, ReconQueue, ReconStatus, RefundStatus, AccountKind, AccountType, AmountKind, ApprovalStatus, ChargeType, HoldStatus, InvoiceStatus,
                           JournalKind, JournalStatus, MarkupScope, PayMethod, PayProvider, PayStatus, RouteType)
 
 NOW = func.now()
@@ -261,3 +261,79 @@ class InvoiceLine(Base, PkMixin, TenantMixin):
     quantity: Mapped[int] = mapped_column(Integer, default=1)
     unit_price: Mapped[Decimal]
     amount: Mapped[Decimal]
+
+
+# ---------------------------------------------------------------- v1.1: reconciliation, refunds, disputes, FX
+class ReconciliationRun(Base, PkMixin, TenantMixin):
+    """Daily four-way match: internal order vs supplier vs PSP vs supplier settlement. Sign-off is a recorded act."""
+    __tablename__ = "reconciliation_runs"
+    run_date: Mapped[dt.date] = mapped_column(Date)
+    started_at: Mapped[dt.datetime] = mapped_column(server_default=NOW)
+    finished_at: Mapped[dt.datetime | None]
+    items_checked: Mapped[int] = mapped_column(Integer, default=0)
+    exceptions_found: Mapped[int] = mapped_column(Integer, default=0)
+    control_total: Mapped[Decimal | None]
+    signed_off_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    signed_off_at: Mapped[dt.datetime | None]
+    __table_args__ = (UniqueConstraint("organization_id", "run_date"),)
+
+
+class ReconciliationItem(Base, PkMixin, TenantMixin, TimestampMixin):
+    """An exception. Every one has a queue, severity, amount at risk, owner and resolution evidence; none is silently corrected."""
+    __tablename__ = "reconciliation_items"
+    run_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("reconciliation_runs.id", ondelete="SET NULL"))
+    queue: Mapped[ReconQueue] = mapped_column(E(ReconQueue))
+    status: Mapped[ReconStatus] = mapped_column(E(ReconStatus), default=ReconStatus.OPEN)
+    severity: Mapped[str] = mapped_column(String(8), default="medium")
+    booking_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("bookings.id", ondelete="RESTRICT"))
+    payment_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("payments.id", ondelete="RESTRICT"))
+    external_ref: Mapped[str | None] = mapped_column(String(96))
+    amount_at_risk: Mapped[Decimal] = mapped_column(default=Decimal("0.00"))
+    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    resolution: Mapped[str | None] = mapped_column(Text)
+    evidence_ref: Mapped[str | None] = mapped_column(String(255))
+    resolved_at: Mapped[dt.datetime | None]
+    __table_args__ = (Index("ix_reconciliation_items_open", "organization_id", "queue", "created_at",
+                            postgresql_where=text("status IN ('open','assigned')")),
+                      Index("ix_reconciliation_items_booking", "booking_id"))
+
+
+class PaymentRefund(Base, PkMixin, TenantMixin, TimestampMixin):
+    """PSP refund. Cancellation confirmed != refund completed; this row is completed only on the PSP's confirmation."""
+    __tablename__ = "payment_refunds"
+    payment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("payments.id", ondelete="RESTRICT"))
+    booking_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("bookings.id", ondelete="RESTRICT"))
+    amount: Mapped[Decimal]
+    currency: Mapped[str] = mapped_column(String(3), default="BDT")
+    status: Mapped[RefundStatus] = mapped_column(E(RefundStatus), default=RefundStatus.PENDING)
+    provider_refund_id: Mapped[str | None] = mapped_column(String(96))
+    reason: Mapped[str | None] = mapped_column(String(255))
+    due_at: Mapped[dt.datetime | None]
+    journal_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("journal_entries.id", ondelete="RESTRICT"))
+    idempotency_key: Mapped[str] = mapped_column(String(80))
+    __table_args__ = (CheckConstraint("amount > 0", name="positive"), UniqueConstraint("organization_id", "idempotency_key"),
+                      Index("ix_payment_refunds_pending_due", "due_at", postgresql_where=text("status = 'pending'")),
+                      Index("uq_payment_refunds_provider", "payment_id", "provider_refund_id", unique=True, postgresql_where=text("provider_refund_id IS NOT NULL")))
+
+
+class PaymentDispute(Base, PkMixin, TenantMixin, TimestampMixin):
+    """Chargeback / gateway dispute."""
+    __tablename__ = "payment_disputes"
+    payment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("payments.id", ondelete="RESTRICT"))
+    provider_case_id: Mapped[str] = mapped_column(String(96))
+    amount: Mapped[Decimal]
+    status: Mapped[DisputeStatus] = mapped_column(E(DisputeStatus), default=DisputeStatus.OPEN)
+    evidence_due_at: Mapped[dt.datetime | None]
+    evidence_ref: Mapped[str | None] = mapped_column(String(255))
+    __table_args__ = (UniqueConstraint("payment_id", "provider_case_id"),)
+
+
+class FxRate(Base, PkMixin, TenantMixin):
+    """Rate used for a conversion, kept so a supplier-currency cost can always be re-derived. Rounding policy lives in the pricing service."""
+    __tablename__ = "fx_rates"
+    base_ccy: Mapped[str] = mapped_column(String(3))
+    quote_ccy: Mapped[str] = mapped_column(String(3))
+    rate: Mapped[Decimal] = mapped_column(Rate)
+    source: Mapped[str] = mapped_column(String(40))
+    as_of: Mapped[dt.datetime]
+    __table_args__ = (CheckConstraint("rate > 0", name="positive"), Index("ix_fx_rates_pair", "organization_id", "base_ccy", "quote_ccy", "as_of"))

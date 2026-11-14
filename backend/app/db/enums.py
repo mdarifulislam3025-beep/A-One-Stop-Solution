@@ -114,7 +114,11 @@ class BookingKind(str, enum.Enum):
 
 class BookingStatus(str, enum.Enum):
     """Lifecycle only. Void/refund/reissue progress lives on after_sales_requests. Full list still to be confirmed with ops."""
-    HOLD = "hold"; PARTIAL_PAYMENT = "partial_payment"; ISSUE_IN_PROCESS = "issue_in_process"; ISSUED = "issued"
+    PAYMENT_PENDING = "payment_pending"
+    HOLD = "hold"  # PNR/order exists, not ticketed (BOOKED_UNTICKETED)
+    PARTIAL_PAYMENT = "partial_payment"; ISSUE_IN_PROCESS = "issue_in_process"; ISSUED = "issued"
+    BOOKING_UNKNOWN = "booking_unknown"; TICKETING_UNKNOWN = "ticketing_unknown"  # outcome uncertain: reconcile, never blind-retry
+    MANUAL_REVIEW = "manual_review"
     ISSUE_REJECTED = "issue_rejected"; CANCELLED = "cancelled"; EXPIRED = "expired"
     VOIDED = "voided"; REFUNDED = "refunded"; REISSUED = "reissued"
 
@@ -178,3 +182,50 @@ class OutboxStatus(str, enum.Enum):
 
 class Channel(str, enum.Enum):
     EMAIL = "email"; SMS = "sms"; WHATSAPP = "whatsapp"; IN_APP = "in_app"
+
+
+class TicketingModel(str, enum.Enum):
+    DIRECT = "direct"; CONSOLIDATOR = "consolidator"; HOST_AGENCY = "host_agency"
+
+
+class SupplierOp(str, enum.Enum):
+    SEARCH = "search"; PRICE = "price"; CREATE_BOOKING = "create_booking"; RETRIEVE = "retrieve"; ISSUE = "issue"
+    VOID = "void"; CANCEL = "cancel"; REFUND_QUOTE = "refund_quote"; REFUND_COMMIT = "refund_commit"
+    CHANGE_QUOTE = "change_quote"; CHANGE_COMMIT = "change_commit"
+
+
+class AttemptStatus(str, enum.Enum):
+    SUCCESS = "success"; BUSINESS_REJECTED = "business_rejected"; RETRYABLE_FAILURE = "retryable_failure"; UNKNOWN = "unknown"
+
+
+class CapMode(str, enum.Enum):
+    SUPPORTED = "supported"; VIA_CONSOLIDATOR = "via_consolidator"; MANUAL = "manual"; UNSUPPORTED = "unsupported"
+
+
+class ReconQueue(str, enum.Enum):
+    BOOKING_UNKNOWN = "booking_unknown"; TICKET_NOT_ISSUED = "ticket_not_issued"
+    PAYMENT_AUTHORIZED_NOT_CAPTURED = "payment_authorized_not_captured"; CAPTURED_NO_BOOKING = "captured_no_booking"
+    BOOKED_NO_PAYMENT = "booked_no_payment"; DUPLICATE_BOOKING = "duplicate_booking"; DUPLICATE_CAPTURE = "duplicate_capture"
+    REFUND_OVERDUE = "refund_overdue"; SUPPLIER_AMOUNT_MISMATCH = "supplier_amount_mismatch"
+    CURRENCY_OR_TAX_VARIANCE = "currency_or_tax_variance"; ADM_ACM_REVIEW = "adm_acm_review"
+
+
+class ReconStatus(str, enum.Enum):
+    OPEN = "open"; ASSIGNED = "assigned"; RESOLVED = "resolved"; WRITTEN_OFF = "written_off"
+
+
+class MemoKind(str, enum.Enum):
+    ADM = "adm"; ACM = "acm"
+
+
+class MemoStatus(str, enum.Enum):
+    REGISTERED = "registered"; UNDER_REVIEW = "under_review"; ACCEPTED = "accepted"; PARTIALLY_ACCEPTED = "partially_accepted"
+    DISPUTED = "disputed"; ESCALATED = "escalated"; CLOSED = "closed"
+
+
+class RefundStatus(str, enum.Enum):
+    PENDING = "pending"; COMPLETED = "completed"; FAILED = "failed"
+
+
+class DisputeStatus(str, enum.Enum):
+    OPEN = "open"; EVIDENCE_SUBMITTED = "evidence_submitted"; WON = "won"; LOST = "lost"

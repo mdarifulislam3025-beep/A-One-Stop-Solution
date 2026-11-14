@@ -1,7 +1,7 @@
 # OTA + Unified ERP: System Architecture Blueprint (Phase 1)
 
-Status: **Phase 1, awaiting approval.** Code in `backend/` is real and tested; Phases 2-4 are not started.
-Schema: 54 tables, validated against PostgreSQL 16 (14 tests; `docs/schema.generated.sql` is the compiled DDL).
+Status: **Phase 1 (v1.1), awaiting approval.** Code in `backend/` is real and tested; Phases 2-4 are not started.
+Schema: 63 tables, validated against PostgreSQL 16 (19 tests; `docs/schema.generated.sql` is the compiled DDL).
 
 ## 1. Executive summary
 
@@ -72,19 +72,29 @@ Request path rules:
 
 ## 6. Booking engine
 
-State machine (`bookings.status`): `hold → partial_payment → issue_in_process → issued`; side exits `issue_rejected`, `cancelled`, `expired`; after-sales end states `voided`, `refunded`, `reissued`. Void/refund/reissue progress (quotation sent/expired/approved…) lives on `after_sales_requests.status`. The complete status list still needs confirming with ops. Every transition writes `booking_status_history` and goes through one `transition()` function; nothing updates `status` directly.
+State machine (`bookings.status`): `payment_pending → hold (PNR exists, not ticketed) → partial_payment → issue_in_process → issued`; **uncertain-outcome states `booking_unknown` and `ticketing_unknown`**, plus `manual_review`; side exits `issue_rejected`, `cancelled`, `expired`; after-sales end states `voided`, `refunded`, `reissued`. A PNR is not a ticket and an authorization is not a capture, so booking, ticketing and payment are tracked separately. Void/refund/reissue progress (quotation sent/expired/approved…) lives on `after_sales_requests.status`. The complete status list still needs confirming with ops. Every transition writes `booking_status_history` and goes through one `transition()` function; nothing updates `status` directly.
 
 Issuing is a **saga**, never one long transaction:
 1. Txn A: validate, re-price live, create booking, hold wallet funds, write outbox `ticketing.issue` (dedupe key = booking id).
 2. Celery `ticketing` queue: call the supplier (idempotent adapter).
 3. Txn B on success: capture hold → journal + ledger, tickets rows, status `issued`. On clear failure: release hold, `issue_rejected`.
-4. **Timeout / unknown outcome:** stay `issue_in_process`; a reconciler queries the supplier by PNR before any retry. Blind retry of ticketing risks double ticketing, which is the costliest failure in this system.
+4. **Timeout / unknown outcome:** the attempt is recorded as `UNKNOWN` in `supplier_attempts` and the booking moves to `booking_unknown` / `ticketing_unknown`; a reconciler queries the supplier by PNR/order reference before any retry. Every adapter call returns `SUCCESS | BUSINESS_REJECTED | RETRYABLE_FAILURE | UNKNOWN`. Blind retry of ticketing risks double ticketing, which is the costliest failure in this system.
 
 Double-booking defence, in order: Redis lock `lock:book:{org}:{dedupe}` (NX, 30 s, fencing token) → idempotency key → DB: `uq_bookings_supplier_pnr`, `uq_bookings_active_dedupe` (same passengers + same flights cannot have two active bookings), `uq_bookings_organization_id_idempotency_key`. All verified by `tests/test_db_constraints.py` on real PostgreSQL.
 
 Mixed-airline round trips: two bookings sharing `mix_group_id` (`direction` out/ret), each with its own PNR; rules from `airline_mix_rules` (canonical pair, allow/block) + `ota_settings` + `airlines.one_way_fare_combinable`. Wallet debit is one journal across both.
 
 Search aggregator: `SupplierAdapter` interface (`search`, `price`, `book`, `issue`, `cancel`, `retrieve`); adapters run concurrently with per-supplier timeout, circuit breaker and rate limit; partial results are returned when one supplier is slow. Cache key = hash(normalized request, pricing group); single-flight so 1,000 identical searches hit suppliers once.
+
+### 6a. Changes in v1.1 (after reviewing your GDS-first document, knowledge vault and API/NDC manuals)
+Added 9 tables and 4 booking states because the documents exposed real gaps in v1.0:
+- `price_quotes`: every reprice kept immutably, with the customer's acceptance and a hash of the fare conditions shown. This is the evidence for chargebacks and ADM disputes.
+- `supplier_attempts`: one row per external mutating call (correlation id, supplier transaction id, status, resolution). `UNKNOWN` rows are the reconciliation queue. Unique per booking + operation + idempotency key.
+- `supplier_capabilities` + `supplier_accounts.ticketing_model`: per-supplier, per-airline capability matrix (supported / via consolidator / manual / unsupported). Shopping support never implies servicing support.
+- `reconciliation_runs` / `reconciliation_items`: daily four-way match with the 11 exception queues from the manuals (booking unknown, ticket not issued, captured with no booking, duplicate capture, refund overdue, supplier amount mismatch, ADM/ACM review …), each with owner, amount at risk and sign-off.
+- `payment_refunds` and `payment_disputes`: PSP refunds and chargebacks (cancellation confirmed is not refund completed).
+- `adm_acm_cases`: memo cases; a CHECK forbids a deadline without a cited source (no generic deadlines).
+- `fx_rates`: rate used for each supplier-currency conversion.
 
 ## 7. Background work (Celery)
 
@@ -147,7 +157,9 @@ erDiagram
   GROUP_FARES ||--o{ BOOKINGS : sold_as
 ```
 
-Full table list by module: **users** (organizations, org_profiles, org_kyc_documents, roles, permissions, role_permissions, users, user_org_roles, mfa_backup_codes, b2c_profiles, travellers, loyalty_accounts, loyalty_ledger, agent_ops) · **erp** (accounts, journal_entries, ledger_entries, wallets, wallet_holds, deposit_requests, payments, payment_events, commission_rules, markup_rules, service_charge_rules, tax_rules, invoices, invoice_lines) · **ota** (suppliers, supplier_accounts, supplier_indicators, airlines, airports, ota_settings, airline_mix_rules, bookings, booking_passengers, flight_segments, tickets, booking_price_lines, booking_status_history, partial_payment_plans, after_sales_requests, after_sales_quote_lines, group_fares, visa_applications, visa_stage_payments, visa_events) · **core** (idempotency_keys, outbox_events, notifications, audit_logs, supplier_api_logs, search_request_logs).
+Full table list by module: **v1.1 additions:** price_quotes, supplier_attempts, supplier_capabilities, adm_acm_cases (ota); reconciliation_runs, reconciliation_items, payment_refunds, payment_disputes, fx_rates (erp).
+
+Full table list by module (v1.0 base): **users** (organizations, org_profiles, org_kyc_documents, roles, permissions, role_permissions, users, user_org_roles, mfa_backup_codes, b2c_profiles, travellers, loyalty_accounts, loyalty_ledger, agent_ops) · **erp** (accounts, journal_entries, ledger_entries, wallets, wallet_holds, deposit_requests, payments, payment_events, commission_rules, markup_rules, service_charge_rules, tax_rules, invoices, invoice_lines) · **ota** (suppliers, supplier_accounts, supplier_indicators, airlines, airports, ota_settings, airline_mix_rules, bookings, booking_passengers, flight_segments, tickets, booking_price_lines, booking_status_history, partial_payment_plans, after_sales_requests, after_sales_quote_lines, group_fares, visa_applications, visa_stage_payments, visa_events) · **core** (idempotency_keys, outbox_events, notifications, audit_logs, supplier_api_logs, search_request_logs).
 
 ## 10. Prototype requirement → schema traceability
 
@@ -225,13 +237,17 @@ Whatever is chosen, **fare, ledger, wallet and booking logic must not remain in 
 ## 15. Risks, alternatives, worst case
 
 - **Supplier access** is the real gating item: live GDS/NDC credentials, certification and PNR-creation rights take weeks to months and have contract terms (caching, look-to-book, ADM exposure). Until then Phase 3 runs against a sandbox/mock adapter. Engineering cannot shorten this.
-- **ADM/ACM and BSP**: the schema stores sale and cost; ADM reconciliation and BSP settlement files are not modelled yet (Phase 5 candidate).
+- **ADM/ACM and BSP**: memo cases are modelled (`adm_acm_cases`); BSP billing/settlement statement import and matching are not yet (Phase 5 candidate).
+- **Currency precision**: `DECIMAL(12,2)` suits BDT/USD but not 3-decimal currencies (KWD, BHD, OMR) or 0-decimal ones (JPY). Until you decide how these settle, such supplier amounts are converted to BDT/USD at `fx_rates`.
 - **Wallet/ledger correctness** is the highest-impact code. Mitigation: DB constraints, property-based concurrency tests, nightly reconciliation, reversing-journal-only corrections.
 - **Scope**: B2C storefront UI, hotel supplier, insurance and package products are modelled only at the booking-core level; their detail tables are Phase 5+.
 - Alternatives considered: microservices (rejected: transactional coupling, operating cost); schema-per-tenant (rejected: thousands of B2C/agency tenants, migration pain); database-per-sister-concern (kept possible later because `organization_id` exists on every table).
 - **Worst case**: a supplier timeout during issue followed by an automatic retry produces two tickets, or a ledger bug debits an agent twice. Both are addressed above (reconcile-before-retry; idempotency + constraints), and both will have dedicated chaos/concurrency tests in Phase 3.
 
 ## 16. Decisions needed from you to start Phase 2
+
+0. **Stack conflict.** Your brief requires Python/FastAPI. The GDS-first document and the vault's note from 12 June propose or require Node.js/NestJS. I am continuing with Python/FastAPI because your latest instruction is explicit. Confirm, because it cannot be mixed.
+0a. **Ticketing authority.** Who issues tickets: your own IATA accreditation, a consolidator, or a host agency? This decides which GDS/API products are even usable and is the gating item for Phase 3.
 
 1. Frontend option A, B or C (section 12). My recommendation: A (with HTMX for admin tables).
 2. Keep the added **Agency Owner** role?

@@ -118,3 +118,65 @@ def test_partitioned_log_tables_exist_as_partitioned(eng):
     with eng.connect() as c:
         rows = c.execute(sa.text("SELECT relname FROM pg_class WHERE relkind='p' ORDER BY 1")).scalars().all()
     assert rows == ["audit_logs", "search_request_logs", "supplier_api_logs"]
+
+
+# ---------------------------------------------------------------- v1.1
+def _supplier_account(c, org):
+    sid, aid = uuid7(), uuid7()
+    c.execute(sa.text("INSERT INTO suppliers (id,code,name,kind) VALUES (:i,:c,'internal','gds')"), dict(i=sid, c=f"S{sid.hex[-12:]}"))
+    c.execute(sa.text("INSERT INTO supplier_accounts (id,organization_id,supplier_id,label,credentials_ref,currency,ticketing_model,priority,rate_limit_rps,timeout_ms,is_active)"
+                      " VALUES (:i,:o,:s,'main','ref','BDT','consolidator',100,20,8000,true)"), dict(i=aid, o=org, s=sid))
+    return aid
+
+
+def test_same_supplier_attempt_key_cannot_be_recorded_twice_for_a_booking(eng):
+    with eng.begin() as c:
+        org = _org(c, "A-1"); u = _user(c, org, "s@s.s"); sa_id = _supplier_account(c, org)
+        _booking(c, org, u, "BKA1", "ka1"); bid = c.execute(sa.text("SELECT id FROM bookings WHERE booking_ref='BKA1'")).scalar()
+    q = ("INSERT INTO supplier_attempts (id,organization_id,booking_id,supplier_account_id,operation,status,idempotency_key,correlation_id)"
+         " VALUES (:i,:o,:b,:s,'create_booking','unknown','idem-1','corr')")
+    with eng.begin() as c:
+        c.execute(sa.text(q), dict(i=uuid7(), o=org, b=bid, s=sa_id))
+    with pytest.raises(IntegrityError):
+        with eng.begin() as c:
+            c.execute(sa.text(q), dict(i=uuid7(), o=org, b=bid, s=sa_id))   # a retry must reuse/inspect the first attempt, not add one
+
+
+def test_booking_unknown_and_ticketing_unknown_are_valid_states_and_bad_states_are_rejected(eng):
+    with eng.begin() as c:
+        org = _org(c, "A-2"); u = _user(c, org, "t@t.t")
+        _booking(c, org, u, "BKU1", "ku1", status="booking_unknown")
+        _booking(c, org, u, "BKU2", "ku2", status="ticketing_unknown")
+    with pytest.raises(IntegrityError):
+        with eng.begin() as c:
+            _booking(c, org, u, "BKU3", "ku3", status="whatever")
+
+
+def test_adm_deadline_requires_a_cited_source(eng):
+    with eng.begin() as c:
+        org = _org(c, "A-3"); aid = uuid7()
+        c.execute(sa.text("INSERT INTO airlines (id,iata_code,name,is_lcc,one_way_fare_combinable) VALUES (:i,'QQ','Test Air',false,true)"), dict(i=aid))
+    q = ("INSERT INTO adm_acm_cases (id,organization_id,kind,memo_no,airline_id,market,amount,currency,issued_on,deadline_at,deadline_source,status)"
+         " VALUES (:i,:o,'adm',:m,:a,'BD',1000.00,'BDT','2026-11-01',:d,:src,'registered')")
+    with pytest.raises(IntegrityError):
+        with eng.begin() as c:
+            c.execute(sa.text(q), dict(i=uuid7(), o=org, m="M1", a=aid, d=dt.datetime(2026, 12, 1), src=None))
+    with eng.begin() as c:
+        c.execute(sa.text(q), dict(i=uuid7(), o=org, m="M2", a=aid, d=dt.datetime(2026, 12, 1), src="BSP rules v?, retrieved 2026-11-15"))
+
+
+def test_capability_row_is_unique_per_account_operation_and_airline_including_null_airline(eng):
+    with eng.begin() as c:
+        org = _org(c, "A-4"); acc = _supplier_account(c, org)
+    q = ("INSERT INTO supplier_capabilities (id,organization_id,supplier_account_id,airline_id,operation,mode)"
+         " VALUES (:i,:o,:a,NULL,'refund_commit','via_consolidator')")
+    with eng.begin() as c:
+        c.execute(sa.text(q), dict(i=uuid7(), o=org, a=acc))
+    with pytest.raises(IntegrityError):
+        with eng.begin() as c:
+            c.execute(sa.text(q), dict(i=uuid7(), o=org, a=acc))
+
+
+def test_partitioned_tables_still_only_the_three_logs(eng):
+    with eng.connect() as c:
+        assert c.execute(sa.text("SELECT count(*) FROM pg_class WHERE relkind='p'")).scalar() == 3

@@ -16,7 +16,7 @@ from sqlalchemy import (BigInteger, Boolean, CheckConstraint, Date, Float, Forei
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, PkMixin, TenantMixin, TimestampMixin, E
-from app.db.enums import (AfterSalesStatus, AfterSalesType, BookingKind, BookingStatus, Direction, GroupStatus, MixEffect,
+from app.db.enums import (AttemptStatus, CapMode, MemoKind, MemoStatus, SupplierOp, TicketingModel, AfterSalesStatus, AfterSalesType, BookingKind, BookingStatus, Direction, GroupStatus, MixEffect,
                           OnDefault, PaxType, PlanStatus, PriceComponent, QuoteComponent, SupplierKind, TicketStatus, VisaStage)
 
 NOW = func.now()
@@ -62,6 +62,8 @@ class SupplierAccount(Base, PkMixin, TenantMixin, TimestampMixin):
     office_id: Mapped[str | None] = mapped_column(String(32))   # PCC / OfficeID
     credentials_ref: Mapped[str] = mapped_column(String(200))
     currency: Mapped[str] = mapped_column(String(3), default="BDT")
+    ticketing_model: Mapped[TicketingModel] = mapped_column(E(TicketingModel), default=TicketingModel.CONSOLIDATOR)  # who can actually issue
+    consolidator_ref: Mapped[str | None] = mapped_column(String(80))
     priority: Mapped[int] = mapped_column(Integer, default=100)
     rate_limit_rps: Mapped[int] = mapped_column(Integer, default=20)
     timeout_ms: Mapped[int] = mapped_column(Integer, default=8000)
@@ -316,3 +318,89 @@ class VisaEvent(Base, TenantMixin):
     actor_user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     created_at: Mapped[dt.datetime] = mapped_column(server_default=NOW)
     __table_args__ = (Index("ix_visa_events_application", "application_id", "id"),)
+
+
+# ---------------------------------------------------------------- v1.1: evidence, attempts, capabilities, memos
+class PriceQuote(Base, PkMixin, TenantMixin):
+    """Every reprice, immutable. The row the customer/agent accepted is what the booking is sold against and what an ADM dispute is argued from.
+    Never UPDATE price or rule fields; only the acceptance columns are set, once."""
+    __tablename__ = "price_quotes"
+    booking_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("bookings.id", ondelete="RESTRICT"))
+    supplier_account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("supplier_accounts.id", ondelete="RESTRICT"))
+    offer_ref: Mapped[str] = mapped_column(String(96))
+    quote_ref: Mapped[str | None] = mapped_column(String(96))
+    currency: Mapped[str] = mapped_column(String(3))
+    total_amount: Mapped[Decimal]
+    price_json: Mapped[dict]                                      # base, taxes[], fare basis, RBD, validating carrier, baggage
+    fare_rules_hash: Mapped[str | None] = mapped_column(String(64))
+    fare_rules_ref: Mapped[str | None] = mapped_column(String(255))  # object-storage key of the rule text in force
+    price_changed: Mapped[bool] = mapped_column(Boolean, default=False)
+    expires_at: Mapped[dt.datetime]
+    accepted_by_user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    accepted_at: Mapped[dt.datetime | None]
+    accepted_conditions_hash: Mapped[str | None] = mapped_column(String(64))  # hash of fare conditions shown at acceptance
+    created_at: Mapped[dt.datetime] = mapped_column(server_default=NOW)
+    __table_args__ = (Index("ix_price_quotes_booking", "booking_id", "created_at"), Index("ix_price_quotes_offer_ref", "offer_ref"))
+
+
+class SupplierAttempt(Base, PkMixin, TenantMixin):
+    """One row per external mutating call. UNKNOWN rows form the reconciliation work-queue; nothing retries them blindly."""
+    __tablename__ = "supplier_attempts"
+    booking_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("bookings.id", ondelete="RESTRICT"))
+    supplier_account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("supplier_accounts.id", ondelete="RESTRICT"))
+    operation: Mapped[SupplierOp] = mapped_column(E(SupplierOp))
+    status: Mapped[AttemptStatus] = mapped_column(E(AttemptStatus))
+    idempotency_key: Mapped[str] = mapped_column(String(96))
+    correlation_id: Mapped[str] = mapped_column(String(48))
+    supplier_txn_id: Mapped[str | None] = mapped_column(String(96))
+    provider_ref: Mapped[str | None] = mapped_column(String(64))   # PNR / order id returned or looked up
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    raw_payload_ref: Mapped[str | None] = mapped_column(String(255))
+    started_at: Mapped[dt.datetime] = mapped_column(server_default=NOW)
+    finished_at: Mapped[dt.datetime | None]
+    resolved_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    resolved_at: Mapped[dt.datetime | None]
+    resolution_note: Mapped[str | None] = mapped_column(String(255))
+    __table_args__ = (UniqueConstraint("booking_id", "operation", "idempotency_key"),
+                      Index("ix_supplier_attempts_unknown", "started_at", postgresql_where=text("status = 'unknown' AND resolved_at IS NULL")),
+                      Index("ix_supplier_attempts_booking", "booking_id", "started_at"))
+
+
+class SupplierCapability(Base, PkMixin, TenantMixin, TimestampMixin):
+    """Live capability matrix per supplier account (optionally per airline). Shopping support never implies servicing support."""
+    __tablename__ = "supplier_capabilities"
+    supplier_account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("supplier_accounts.id", ondelete="CASCADE"))
+    airline_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("airlines.id", ondelete="CASCADE"))
+    operation: Mapped[SupplierOp] = mapped_column(E(SupplierOp))
+    mode: Mapped[CapMode] = mapped_column(E(CapMode))
+    api_version: Mapped[str | None] = mapped_column(String(32))
+    verified_on: Mapped[dt.date | None] = mapped_column(Date)
+    source_note: Mapped[str | None] = mapped_column(String(255))   # contract clause / certification evidence
+    __table_args__ = (Index("uq_supplier_capabilities_key", "supplier_account_id", "operation", text("coalesce(airline_id, '00000000-0000-0000-0000-000000000000'::uuid)"), unique=True),)
+
+
+class AdmAcmCase(Base, PkMixin, TenantMixin, TimestampMixin):
+    """Agency debit/credit memo case. deadline_source is mandatory: never a generic deadline, always the verified BSP/airline source."""
+    __tablename__ = "adm_acm_cases"
+    kind: Mapped[MemoKind] = mapped_column(E(MemoKind))
+    memo_no: Mapped[str] = mapped_column(String(40))
+    airline_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("airlines.id", ondelete="RESTRICT"))
+    market: Mapped[str] = mapped_column(String(2), default="BD")
+    booking_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("bookings.id", ondelete="RESTRICT"))
+    ticket_number: Mapped[str | None] = mapped_column(String(16))
+    reason_code: Mapped[str | None] = mapped_column(String(32))
+    allegation: Mapped[str | None] = mapped_column(Text)
+    amount: Mapped[Decimal]
+    currency: Mapped[str] = mapped_column(String(3), default="BDT")
+    issued_on: Mapped[dt.date] = mapped_column(Date)
+    deadline_at: Mapped[dt.datetime | None]
+    deadline_source: Mapped[str | None] = mapped_column(String(255))
+    status: Mapped[MemoStatus] = mapped_column(E(MemoStatus), default=MemoStatus.REGISTERED)
+    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    agency_position: Mapped[str | None] = mapped_column(Text)
+    accepted_amount: Mapped[Decimal | None]
+    evidence_index: Mapped[dict] = mapped_column(default=dict, server_default=text("'{}'::jsonb"))
+    journal_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("journal_entries.id", ondelete="RESTRICT"))
+    __table_args__ = (UniqueConstraint("organization_id", "airline_id", "memo_no"),
+                      CheckConstraint("deadline_at IS NULL OR deadline_source IS NOT NULL", name="deadline_needs_source"),
+                      Index("ix_adm_acm_cases_open_deadline", "deadline_at", postgresql_where=text("status NOT IN ('accepted','closed')")))

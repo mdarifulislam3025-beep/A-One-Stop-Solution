@@ -131,6 +131,23 @@ CREATE INDEX ix_audit_logs_organization_id ON audit_logs (organization_id);
 
 CREATE INDEX ix_audit_logs_org_created ON audit_logs (organization_id, created_at);
 
+CREATE TABLE fx_rates (
+	base_ccy VARCHAR(3) NOT NULL, 
+	quote_ccy VARCHAR(3) NOT NULL, 
+	rate NUMERIC(9, 6) NOT NULL, 
+	source VARCHAR(40) NOT NULL, 
+	as_of TIMESTAMP WITH TIME ZONE NOT NULL, 
+	id UUID NOT NULL, 
+	organization_id UUID NOT NULL, 
+	CONSTRAINT pk_fx_rates PRIMARY KEY (id), 
+	CONSTRAINT ck_fx_rates_positive CHECK (rate > 0), 
+	CONSTRAINT fk_fx_rates_organization_id_organizations FOREIGN KEY(organization_id) REFERENCES organizations (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX ix_fx_rates_pair ON fx_rates (organization_id, base_ccy, quote_ccy, as_of);
+
+CREATE INDEX ix_fx_rates_organization_id ON fx_rates (organization_id);
+
 CREATE TABLE group_fares (
 	code VARCHAR(32) NOT NULL, 
 	airline_id UUID NOT NULL, 
@@ -241,9 +258,9 @@ CREATE TABLE outbox_events (
 
 CREATE INDEX ix_outbox_events_pending ON outbox_events (next_attempt_at) WHERE status = 'pending';
 
-CREATE UNIQUE INDEX uq_outbox_events_dedupe ON outbox_events (dedupe_key) WHERE dedupe_key IS NOT NULL;
-
 CREATE INDEX ix_outbox_events_organization_id ON outbox_events (organization_id);
+
+CREATE UNIQUE INDEX uq_outbox_events_dedupe ON outbox_events (dedupe_key) WHERE dedupe_key IS NOT NULL;
 
 CREATE TABLE payment_events (
 	organization_id UUID, 
@@ -309,9 +326,9 @@ CREATE TABLE service_charge_rules (
 	CONSTRAINT fk_service_charge_rules_organization_id_organizations FOREIGN KEY(organization_id) REFERENCES organizations (id) ON DELETE RESTRICT
 );
 
-CREATE INDEX ix_service_charge_rules_organization_id ON service_charge_rules (organization_id);
-
 CREATE INDEX ix_service_charge_rules_lookup ON service_charge_rules (organization_id, charge_type);
+
+CREATE INDEX ix_service_charge_rules_organization_id ON service_charge_rules (organization_id);
 
 CREATE TABLE supplier_accounts (
 	supplier_id UUID NOT NULL, 
@@ -319,6 +336,8 @@ CREATE TABLE supplier_accounts (
 	office_id VARCHAR(32), 
 	credentials_ref VARCHAR(200) NOT NULL, 
 	currency VARCHAR(3) NOT NULL, 
+	ticketing_model VARCHAR(32) NOT NULL, 
+	consolidator_ref VARCHAR(80), 
 	priority INTEGER NOT NULL, 
 	rate_limit_rps INTEGER NOT NULL, 
 	timeout_ms INTEGER NOT NULL, 
@@ -330,6 +349,7 @@ CREATE TABLE supplier_accounts (
 	CONSTRAINT pk_supplier_accounts PRIMARY KEY (id), 
 	CONSTRAINT uq_supplier_accounts_organization_id_supplier_id_label UNIQUE (organization_id, supplier_id, label), 
 	CONSTRAINT fk_supplier_accounts_supplier_id_suppliers FOREIGN KEY(supplier_id) REFERENCES suppliers (id) ON DELETE RESTRICT, 
+	CONSTRAINT ck_supplier_accounts_ticketingmodel CHECK (ticketing_model IN ('direct', 'consolidator', 'host_agency')), 
 	CONSTRAINT fk_supplier_accounts_organization_id_organizations FOREIGN KEY(organization_id) REFERENCES organizations (id) ON DELETE RESTRICT
 );
 
@@ -523,7 +543,7 @@ CREATE TABLE bookings (
 	CONSTRAINT uq_bookings_organization_id_idempotency_key UNIQUE (organization_id, idempotency_key), 
 	CONSTRAINT uq_bookings_booking_ref UNIQUE (booking_ref), 
 	CONSTRAINT ck_bookings_bookingkind CHECK (kind IN ('flight', 'hotel', 'visa', 'package', 'insurance', 'group')), 
-	CONSTRAINT ck_bookings_bookingstatus CHECK (status IN ('hold', 'partial_payment', 'issue_in_process', 'issued', 'issue_rejected', 'cancelled', 'expired', 'voided', 'refunded', 'reissued')), 
+	CONSTRAINT ck_bookings_bookingstatus CHECK (status IN ('payment_pending', 'hold', 'partial_payment', 'issue_in_process', 'issued', 'booking_unknown', 'ticketing_unknown', 'manual_review', 'issue_rejected', 'cancelled', 'expired', 'voided', 'refunded', 'reissued')), 
 	CONSTRAINT fk_bookings_booked_by_user_id_users FOREIGN KEY(booked_by_user_id) REFERENCES users (id) ON DELETE RESTRICT, 
 	CONSTRAINT fk_bookings_customer_user_id_users FOREIGN KEY(customer_user_id) REFERENCES users (id) ON DELETE RESTRICT, 
 	CONSTRAINT fk_bookings_supplier_account_id_supplier_accounts FOREIGN KEY(supplier_account_id) REFERENCES supplier_accounts (id) ON DELETE RESTRICT, 
@@ -539,8 +559,6 @@ CREATE INDEX ix_bookings_customer ON bookings (customer_user_id, created_at);
 
 CREATE INDEX ix_bookings_mix_group ON bookings (mix_group_id);
 
-CREATE INDEX ix_bookings_organization_id ON bookings (organization_id);
-
 CREATE UNIQUE INDEX uq_bookings_supplier_pnr ON bookings (supplier_account_id, supplier_pnr) WHERE supplier_pnr IS NOT NULL;
 
 CREATE INDEX ix_bookings_org_status_created ON bookings (organization_id, status, created_at);
@@ -554,6 +572,8 @@ CREATE UNIQUE INDEX uq_bookings_active_dedupe ON bookings (organization_id, dedu
 CREATE INDEX ix_bookings_timelimit_open ON bookings (ticket_time_limit_at) WHERE status IN ('hold','partial_payment');
 
 CREATE INDEX ix_bookings_airline_pnr ON bookings (airline_pnr);
+
+CREATE INDEX ix_bookings_organization_id ON bookings (organization_id);
 
 CREATE TABLE commission_rules (
 	agency_org_id UUID, 
@@ -579,9 +599,9 @@ CREATE TABLE commission_rules (
 	CONSTRAINT fk_commission_rules_organization_id_organizations FOREIGN KEY(organization_id) REFERENCES organizations (id) ON DELETE RESTRICT
 );
 
-CREATE INDEX ix_commission_rules_organization_id ON commission_rules (organization_id);
-
 CREATE INDEX ix_commission_rules_lookup ON commission_rules (organization_id, airline_id, route_type, valid_from);
+
+CREATE INDEX ix_commission_rules_organization_id ON commission_rules (organization_id);
 
 CREATE TABLE loyalty_accounts (
 	user_id UUID NOT NULL, 
@@ -688,6 +708,49 @@ CREATE TABLE org_profiles (
 	CONSTRAINT ck_org_profiles_kycstatus CHECK (kyc_status IN ('submitted', 'verified', 'rejected')), 
 	CONSTRAINT fk_org_profiles_approved_by_users FOREIGN KEY(approved_by) REFERENCES users (id) ON DELETE SET NULL
 );
+
+CREATE TABLE reconciliation_runs (
+	run_date DATE NOT NULL, 
+	started_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, 
+	finished_at TIMESTAMP WITH TIME ZONE, 
+	items_checked INTEGER NOT NULL, 
+	exceptions_found INTEGER NOT NULL, 
+	control_total NUMERIC(12, 2), 
+	signed_off_by UUID, 
+	signed_off_at TIMESTAMP WITH TIME ZONE, 
+	id UUID NOT NULL, 
+	organization_id UUID NOT NULL, 
+	CONSTRAINT pk_reconciliation_runs PRIMARY KEY (id), 
+	CONSTRAINT uq_reconciliation_runs_organization_id_run_date UNIQUE (organization_id, run_date), 
+	CONSTRAINT fk_reconciliation_runs_signed_off_by_users FOREIGN KEY(signed_off_by) REFERENCES users (id) ON DELETE SET NULL, 
+	CONSTRAINT fk_reconciliation_runs_organization_id_organizations FOREIGN KEY(organization_id) REFERENCES organizations (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX ix_reconciliation_runs_organization_id ON reconciliation_runs (organization_id);
+
+CREATE TABLE supplier_capabilities (
+	supplier_account_id UUID NOT NULL, 
+	airline_id UUID, 
+	operation VARCHAR(32) NOT NULL, 
+	mode VARCHAR(32) NOT NULL, 
+	api_version VARCHAR(32), 
+	verified_on DATE, 
+	source_note VARCHAR(255), 
+	id UUID NOT NULL, 
+	organization_id UUID NOT NULL, 
+	created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, 
+	updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, 
+	CONSTRAINT pk_supplier_capabilities PRIMARY KEY (id), 
+	CONSTRAINT fk_supplier_capabilities_supplier_account_id_supplier_accounts FOREIGN KEY(supplier_account_id) REFERENCES supplier_accounts (id) ON DELETE CASCADE, 
+	CONSTRAINT fk_supplier_capabilities_airline_id_airlines FOREIGN KEY(airline_id) REFERENCES airlines (id) ON DELETE CASCADE, 
+	CONSTRAINT ck_supplier_capabilities_supplierop CHECK (operation IN ('search', 'price', 'create_booking', 'retrieve', 'issue', 'void', 'cancel', 'refund_quote', 'refund_commit', 'change_quote', 'change_commit')), 
+	CONSTRAINT ck_supplier_capabilities_capmode CHECK (mode IN ('supported', 'via_consolidator', 'manual', 'unsupported')), 
+	CONSTRAINT fk_supplier_capabilities_organization_id_organizations FOREIGN KEY(organization_id) REFERENCES organizations (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX ix_supplier_capabilities_organization_id ON supplier_capabilities (organization_id);
+
+CREATE UNIQUE INDEX uq_supplier_capabilities_key ON supplier_capabilities (supplier_account_id, operation, coalesce(airline_id, '00000000-0000-0000-0000-000000000000'::uuid));
 
 CREATE TABLE travellers (
 	owner_user_id UUID NOT NULL, 
@@ -823,9 +886,9 @@ CREATE TABLE booking_status_history (
 	CONSTRAINT fk_booking_status_history_organization_id_organizations FOREIGN KEY(organization_id) REFERENCES organizations (id) ON DELETE RESTRICT
 );
 
-CREATE INDEX ix_booking_status_history_booking ON booking_status_history (booking_id, id);
-
 CREATE INDEX ix_booking_status_history_organization_id ON booking_status_history (organization_id);
+
+CREATE INDEX ix_booking_status_history_booking ON booking_status_history (booking_id, id);
 
 CREATE TABLE flight_segments (
 	booking_id UUID NOT NULL, 
@@ -854,11 +917,11 @@ CREATE TABLE flight_segments (
 	CONSTRAINT fk_flight_segments_organization_id_organizations FOREIGN KEY(organization_id) REFERENCES organizations (id) ON DELETE RESTRICT
 );
 
-CREATE INDEX ix_flight_segments_dep ON flight_segments (origin, destination, departs_at);
-
 CREATE INDEX ix_flight_segments_organization_id ON flight_segments (organization_id);
 
 CREATE INDEX ix_flight_segments_booking_id ON flight_segments (booking_id);
+
+CREATE INDEX ix_flight_segments_dep ON flight_segments (origin, destination, departs_at);
 
 CREATE TABLE payments (
 	payer_user_id UUID, 
@@ -886,13 +949,78 @@ CREATE TABLE payments (
 	CONSTRAINT fk_payments_organization_id_organizations FOREIGN KEY(organization_id) REFERENCES organizations (id) ON DELETE RESTRICT
 );
 
-CREATE INDEX ix_payments_booking_id ON payments (booking_id);
-
 CREATE INDEX ix_payments_org_status_created ON payments (organization_id, status, created_at);
 
 CREATE INDEX ix_payments_organization_id ON payments (organization_id);
 
 CREATE UNIQUE INDEX uq_payments_provider_txn ON payments (provider, provider_txn_id) WHERE provider_txn_id IS NOT NULL;
+
+CREATE INDEX ix_payments_booking_id ON payments (booking_id);
+
+CREATE TABLE price_quotes (
+	booking_id UUID, 
+	supplier_account_id UUID NOT NULL, 
+	offer_ref VARCHAR(96) NOT NULL, 
+	quote_ref VARCHAR(96), 
+	currency VARCHAR(3) NOT NULL, 
+	total_amount NUMERIC(12, 2) NOT NULL, 
+	price_json JSONB NOT NULL, 
+	fare_rules_hash VARCHAR(64), 
+	fare_rules_ref VARCHAR(255), 
+	price_changed BOOLEAN NOT NULL, 
+	expires_at TIMESTAMP WITH TIME ZONE NOT NULL, 
+	accepted_by_user_id UUID, 
+	accepted_at TIMESTAMP WITH TIME ZONE, 
+	accepted_conditions_hash VARCHAR(64), 
+	created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, 
+	id UUID NOT NULL, 
+	organization_id UUID NOT NULL, 
+	CONSTRAINT pk_price_quotes PRIMARY KEY (id), 
+	CONSTRAINT fk_price_quotes_booking_id_bookings FOREIGN KEY(booking_id) REFERENCES bookings (id) ON DELETE RESTRICT, 
+	CONSTRAINT fk_price_quotes_supplier_account_id_supplier_accounts FOREIGN KEY(supplier_account_id) REFERENCES supplier_accounts (id) ON DELETE RESTRICT, 
+	CONSTRAINT fk_price_quotes_accepted_by_user_id_users FOREIGN KEY(accepted_by_user_id) REFERENCES users (id) ON DELETE SET NULL, 
+	CONSTRAINT fk_price_quotes_organization_id_organizations FOREIGN KEY(organization_id) REFERENCES organizations (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX ix_price_quotes_organization_id ON price_quotes (organization_id);
+
+CREATE INDEX ix_price_quotes_booking ON price_quotes (booking_id, created_at);
+
+CREATE INDEX ix_price_quotes_offer_ref ON price_quotes (offer_ref);
+
+CREATE TABLE supplier_attempts (
+	booking_id UUID, 
+	supplier_account_id UUID NOT NULL, 
+	operation VARCHAR(32) NOT NULL, 
+	status VARCHAR(32) NOT NULL, 
+	idempotency_key VARCHAR(96) NOT NULL, 
+	correlation_id VARCHAR(48) NOT NULL, 
+	supplier_txn_id VARCHAR(96), 
+	provider_ref VARCHAR(64), 
+	error_code VARCHAR(64), 
+	raw_payload_ref VARCHAR(255), 
+	started_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, 
+	finished_at TIMESTAMP WITH TIME ZONE, 
+	resolved_by UUID, 
+	resolved_at TIMESTAMP WITH TIME ZONE, 
+	resolution_note VARCHAR(255), 
+	id UUID NOT NULL, 
+	organization_id UUID NOT NULL, 
+	CONSTRAINT pk_supplier_attempts PRIMARY KEY (id), 
+	CONSTRAINT uq_supplier_attempts_booking_id_operation_idempotency_key UNIQUE (booking_id, operation, idempotency_key), 
+	CONSTRAINT fk_supplier_attempts_booking_id_bookings FOREIGN KEY(booking_id) REFERENCES bookings (id) ON DELETE RESTRICT, 
+	CONSTRAINT fk_supplier_attempts_supplier_account_id_supplier_accounts FOREIGN KEY(supplier_account_id) REFERENCES supplier_accounts (id) ON DELETE RESTRICT, 
+	CONSTRAINT ck_supplier_attempts_supplierop CHECK (operation IN ('search', 'price', 'create_booking', 'retrieve', 'issue', 'void', 'cancel', 'refund_quote', 'refund_commit', 'change_quote', 'change_commit')), 
+	CONSTRAINT ck_supplier_attempts_attemptstatus CHECK (status IN ('success', 'business_rejected', 'retryable_failure', 'unknown')), 
+	CONSTRAINT fk_supplier_attempts_resolved_by_users FOREIGN KEY(resolved_by) REFERENCES users (id) ON DELETE SET NULL, 
+	CONSTRAINT fk_supplier_attempts_organization_id_organizations FOREIGN KEY(organization_id) REFERENCES organizations (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX ix_supplier_attempts_unknown ON supplier_attempts (started_at) WHERE status = 'unknown' AND resolved_at IS NULL;
+
+CREATE INDEX ix_supplier_attempts_booking ON supplier_attempts (booking_id, started_at);
+
+CREATE INDEX ix_supplier_attempts_organization_id ON supplier_attempts (organization_id);
 
 CREATE TABLE visa_events (
 	id BIGSERIAL NOT NULL, 
@@ -909,9 +1037,9 @@ CREATE TABLE visa_events (
 	CONSTRAINT fk_visa_events_organization_id_organizations FOREIGN KEY(organization_id) REFERENCES organizations (id) ON DELETE RESTRICT
 );
 
-CREATE INDEX ix_visa_events_application ON visa_events (application_id, id);
-
 CREATE INDEX ix_visa_events_organization_id ON visa_events (organization_id);
+
+CREATE INDEX ix_visa_events_application ON visa_events (application_id, id);
 
 CREATE TABLE wallet_holds (
 	wallet_id UUID NOT NULL, 
@@ -993,6 +1121,59 @@ CREATE INDEX ix_journal_entries_org_posted ON journal_entries (organization_id, 
 
 CREATE INDEX ix_journal_entries_booking_id ON journal_entries (booking_id);
 
+CREATE TABLE payment_disputes (
+	payment_id UUID NOT NULL, 
+	provider_case_id VARCHAR(96) NOT NULL, 
+	amount NUMERIC(12, 2) NOT NULL, 
+	status VARCHAR(32) NOT NULL, 
+	evidence_due_at TIMESTAMP WITH TIME ZONE, 
+	evidence_ref VARCHAR(255), 
+	id UUID NOT NULL, 
+	organization_id UUID NOT NULL, 
+	created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, 
+	updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, 
+	CONSTRAINT pk_payment_disputes PRIMARY KEY (id), 
+	CONSTRAINT uq_payment_disputes_payment_id_provider_case_id UNIQUE (payment_id, provider_case_id), 
+	CONSTRAINT fk_payment_disputes_payment_id_payments FOREIGN KEY(payment_id) REFERENCES payments (id) ON DELETE RESTRICT, 
+	CONSTRAINT ck_payment_disputes_disputestatus CHECK (status IN ('open', 'evidence_submitted', 'won', 'lost')), 
+	CONSTRAINT fk_payment_disputes_organization_id_organizations FOREIGN KEY(organization_id) REFERENCES organizations (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX ix_payment_disputes_organization_id ON payment_disputes (organization_id);
+
+CREATE TABLE reconciliation_items (
+	run_id UUID, 
+	queue VARCHAR(32) NOT NULL, 
+	status VARCHAR(32) NOT NULL, 
+	severity VARCHAR(8) NOT NULL, 
+	booking_id UUID, 
+	payment_id UUID, 
+	external_ref VARCHAR(96), 
+	amount_at_risk NUMERIC(12, 2) NOT NULL, 
+	owner_user_id UUID, 
+	resolution TEXT, 
+	evidence_ref VARCHAR(255), 
+	resolved_at TIMESTAMP WITH TIME ZONE, 
+	id UUID NOT NULL, 
+	organization_id UUID NOT NULL, 
+	created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, 
+	updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, 
+	CONSTRAINT pk_reconciliation_items PRIMARY KEY (id), 
+	CONSTRAINT fk_reconciliation_items_run_id_reconciliation_runs FOREIGN KEY(run_id) REFERENCES reconciliation_runs (id) ON DELETE SET NULL, 
+	CONSTRAINT ck_reconciliation_items_reconqueue CHECK (queue IN ('booking_unknown', 'ticket_not_issued', 'payment_authorized_not_captured', 'captured_no_booking', 'booked_no_payment', 'duplicate_booking', 'duplicate_capture', 'refund_overdue', 'supplier_amount_mismatch', 'currency_or_tax_variance', 'adm_acm_review')), 
+	CONSTRAINT ck_reconciliation_items_reconstatus CHECK (status IN ('open', 'assigned', 'resolved', 'written_off')), 
+	CONSTRAINT fk_reconciliation_items_booking_id_bookings FOREIGN KEY(booking_id) REFERENCES bookings (id) ON DELETE RESTRICT, 
+	CONSTRAINT fk_reconciliation_items_payment_id_payments FOREIGN KEY(payment_id) REFERENCES payments (id) ON DELETE RESTRICT, 
+	CONSTRAINT fk_reconciliation_items_owner_user_id_users FOREIGN KEY(owner_user_id) REFERENCES users (id) ON DELETE SET NULL, 
+	CONSTRAINT fk_reconciliation_items_organization_id_organizations FOREIGN KEY(organization_id) REFERENCES organizations (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX ix_reconciliation_items_organization_id ON reconciliation_items (organization_id);
+
+CREATE INDEX ix_reconciliation_items_booking ON reconciliation_items (booking_id);
+
+CREATE INDEX ix_reconciliation_items_open ON reconciliation_items (organization_id, queue, created_at) WHERE status IN ('open','assigned');
+
 CREATE TABLE tickets (
 	booking_id UUID NOT NULL, 
 	passenger_id UUID NOT NULL, 
@@ -1011,9 +1192,49 @@ CREATE TABLE tickets (
 	CONSTRAINT fk_tickets_organization_id_organizations FOREIGN KEY(organization_id) REFERENCES organizations (id) ON DELETE RESTRICT
 );
 
+CREATE INDEX ix_tickets_organization_id ON tickets (organization_id);
+
 CREATE INDEX ix_tickets_booking_id ON tickets (booking_id);
 
-CREATE INDEX ix_tickets_organization_id ON tickets (organization_id);
+CREATE TABLE adm_acm_cases (
+	kind VARCHAR(32) NOT NULL, 
+	memo_no VARCHAR(40) NOT NULL, 
+	airline_id UUID NOT NULL, 
+	market VARCHAR(2) NOT NULL, 
+	booking_id UUID, 
+	ticket_number VARCHAR(16), 
+	reason_code VARCHAR(32), 
+	allegation TEXT, 
+	amount NUMERIC(12, 2) NOT NULL, 
+	currency VARCHAR(3) NOT NULL, 
+	issued_on DATE NOT NULL, 
+	deadline_at TIMESTAMP WITH TIME ZONE, 
+	deadline_source VARCHAR(255), 
+	status VARCHAR(32) NOT NULL, 
+	owner_user_id UUID, 
+	agency_position TEXT, 
+	accepted_amount NUMERIC(12, 2), 
+	evidence_index JSONB DEFAULT '{}'::jsonb NOT NULL, 
+	journal_id UUID, 
+	id UUID NOT NULL, 
+	organization_id UUID NOT NULL, 
+	created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, 
+	updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, 
+	CONSTRAINT pk_adm_acm_cases PRIMARY KEY (id), 
+	CONSTRAINT uq_adm_acm_cases_organization_id_airline_id_memo_no UNIQUE (organization_id, airline_id, memo_no), 
+	CONSTRAINT ck_adm_acm_cases_deadline_needs_source CHECK (deadline_at IS NULL OR deadline_source IS NOT NULL), 
+	CONSTRAINT ck_adm_acm_cases_memokind CHECK (kind IN ('adm', 'acm')), 
+	CONSTRAINT fk_adm_acm_cases_airline_id_airlines FOREIGN KEY(airline_id) REFERENCES airlines (id) ON DELETE RESTRICT, 
+	CONSTRAINT fk_adm_acm_cases_booking_id_bookings FOREIGN KEY(booking_id) REFERENCES bookings (id) ON DELETE RESTRICT, 
+	CONSTRAINT ck_adm_acm_cases_memostatus CHECK (status IN ('registered', 'under_review', 'accepted', 'partially_accepted', 'disputed', 'escalated', 'closed')), 
+	CONSTRAINT fk_adm_acm_cases_owner_user_id_users FOREIGN KEY(owner_user_id) REFERENCES users (id) ON DELETE SET NULL, 
+	CONSTRAINT fk_adm_acm_cases_journal_id_journal_entries FOREIGN KEY(journal_id) REFERENCES journal_entries (id) ON DELETE RESTRICT, 
+	CONSTRAINT fk_adm_acm_cases_organization_id_organizations FOREIGN KEY(organization_id) REFERENCES organizations (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX ix_adm_acm_cases_open_deadline ON adm_acm_cases (deadline_at) WHERE status NOT IN ('accepted','closed');
+
+CREATE INDEX ix_adm_acm_cases_organization_id ON adm_acm_cases (organization_id);
 
 CREATE TABLE after_sales_requests (
 	booking_id UUID NOT NULL, 
@@ -1050,13 +1271,13 @@ CREATE TABLE after_sales_requests (
 	CONSTRAINT fk_after_sales_requests_organization_id_organizations FOREIGN KEY(organization_id) REFERENCES organizations (id) ON DELETE RESTRICT
 );
 
-CREATE INDEX ix_after_sales_requests_organization_id ON after_sales_requests (organization_id);
+CREATE INDEX ix_after_sales_org_type_status ON after_sales_requests (organization_id, request_type, status);
 
-CREATE INDEX ix_after_sales_booking ON after_sales_requests (booking_id);
+CREATE INDEX ix_after_sales_requests_organization_id ON after_sales_requests (organization_id);
 
 CREATE INDEX ix_after_sales_quote_expiry ON after_sales_requests (quote_expires_at) WHERE status = 'quotation_sent';
 
-CREATE INDEX ix_after_sales_org_type_status ON after_sales_requests (organization_id, request_type, status);
+CREATE INDEX ix_after_sales_booking ON after_sales_requests (booking_id);
 
 CREATE TABLE deposit_requests (
 	wallet_id UUID NOT NULL, 
@@ -1181,9 +1402,40 @@ CREATE TABLE partial_payment_plans (
 	CONSTRAINT fk_partial_payment_plans_organization_id_organizations FOREIGN KEY(organization_id) REFERENCES organizations (id) ON DELETE RESTRICT
 );
 
+CREATE INDEX ix_partial_payment_plans_organization_id ON partial_payment_plans (organization_id);
+
 CREATE INDEX ix_partial_payment_plans_due ON partial_payment_plans (status, settlement_due_at);
 
-CREATE INDEX ix_partial_payment_plans_organization_id ON partial_payment_plans (organization_id);
+CREATE TABLE payment_refunds (
+	payment_id UUID NOT NULL, 
+	booking_id UUID, 
+	amount NUMERIC(12, 2) NOT NULL, 
+	currency VARCHAR(3) NOT NULL, 
+	status VARCHAR(32) NOT NULL, 
+	provider_refund_id VARCHAR(96), 
+	reason VARCHAR(255), 
+	due_at TIMESTAMP WITH TIME ZONE, 
+	journal_id UUID, 
+	idempotency_key VARCHAR(80) NOT NULL, 
+	id UUID NOT NULL, 
+	organization_id UUID NOT NULL, 
+	created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, 
+	updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, 
+	CONSTRAINT pk_payment_refunds PRIMARY KEY (id), 
+	CONSTRAINT ck_payment_refunds_positive CHECK (amount > 0), 
+	CONSTRAINT uq_payment_refunds_organization_id_idempotency_key UNIQUE (organization_id, idempotency_key), 
+	CONSTRAINT fk_payment_refunds_payment_id_payments FOREIGN KEY(payment_id) REFERENCES payments (id) ON DELETE RESTRICT, 
+	CONSTRAINT fk_payment_refunds_booking_id_bookings FOREIGN KEY(booking_id) REFERENCES bookings (id) ON DELETE RESTRICT, 
+	CONSTRAINT ck_payment_refunds_refundstatus CHECK (status IN ('pending', 'completed', 'failed')), 
+	CONSTRAINT fk_payment_refunds_journal_id_journal_entries FOREIGN KEY(journal_id) REFERENCES journal_entries (id) ON DELETE RESTRICT, 
+	CONSTRAINT fk_payment_refunds_organization_id_organizations FOREIGN KEY(organization_id) REFERENCES organizations (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX ix_payment_refunds_pending_due ON payment_refunds (due_at) WHERE status = 'pending';
+
+CREATE INDEX ix_payment_refunds_organization_id ON payment_refunds (organization_id);
+
+CREATE UNIQUE INDEX uq_payment_refunds_provider ON payment_refunds (payment_id, provider_refund_id) WHERE provider_refund_id IS NOT NULL;
 
 CREATE TABLE visa_stage_payments (
 	application_id UUID NOT NULL, 
