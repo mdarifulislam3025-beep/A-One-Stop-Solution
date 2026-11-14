@@ -1,0 +1,11 @@
+[project]
+name = "aoss-ota-backend"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["fastapi>=0.115", "uvicorn[standard]", "sqlalchemy[asyncio]>=2.0.36", "asyncpg", "alembic", "pydantic-settings",
+                "redis>=5", "celery[redis]>=5.4", "argon2-cffi", "pyjwt", "cryptography", "jinja2", "httpx"]
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "psycopg[binary]", "ruff", "mypy"]
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
